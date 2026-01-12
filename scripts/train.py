@@ -1,6 +1,8 @@
 import logging
 import os
+import sys
 import time
+import gc
 
 import hydra
 import torch
@@ -8,6 +10,7 @@ import numpy as np
 import pandas as pd
 import wandb
 import matplotlib.pyplot as plt
+import imageio.v2 as imageio
 
 from torch.func import vmap
 from tqdm import tqdm
@@ -39,6 +42,9 @@ def main(cfg):
     OmegaConf.set_struct(cfg, False)
     simulation_app = init_simulation_app(cfg)
     run = init_wandb(cfg)
+    # wandb can return a transient run directory; make sure it exists before checkpointing
+    if run is not None and getattr(run, "dir", None):
+        os.makedirs(run.dir, exist_ok=True)
     setproctitle(run.name)
     print(OmegaConf.to_yaml(cfg))
 
@@ -108,34 +114,30 @@ def main(cfg):
 
     @torch.no_grad()
     def evaluate(
-        seed: int=0,
-        exploration_type: ExplorationType=ExplorationType.MODE
+        seed: int = 0,
+        exploration_type: ExplorationType = ExplorationType.MODE,
+        tag: str | None = None,
     ):
 
-        base_env.enable_render(True)
         base_env.eval()
         env.eval()
         env.set_seed(seed)
-
-        render_callback = RenderCallback(interval=2)
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
                 max_steps=base_env.max_episode_length,
                 policy=policy,
-                callback=render_callback,
                 auto_reset=True,
                 break_when_any_done=False,
                 return_contiguous=False,
             )
-        base_env.enable_render(not cfg.headless)
         env.reset()
 
         done = trajs.get(("next", "done"))
         first_done = torch.argmax(done.long(), dim=1).cpu()
 
         def take_first_episode(tensor: torch.Tensor):
-            indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
+            indices = first_done.reshape(first_done.shape + (1,) * (tensor.ndim - 2))
             return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
 
         traj_stats = {
@@ -148,22 +150,82 @@ def main(cfg):
             for k, v in traj_stats.items()
         }
 
-        # log video
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-            format="mp4"
-        )
+        return info
 
-        # log distributions
-        # df = pd.DataFrame(traj_stats)
-        # table = wandb.Table(dataframe=df)
-        # info["eval/return"] = wandb.plot.histogram(table, "return")
-        # info["eval/episode_len"] = wandb.plot.histogram(table, "episode_len")
+    @torch.no_grad()
+    def record_video(
+        seed: int = 0,
+        exploration_type: ExplorationType = ExplorationType.MODE,
+        tag: str | None = None,
+    ):
+        """Record a rollout video while keeping memory usage low."""
+        base_env.enable_render(True)
+        base_env.eval()
+        env.eval()
+        env.set_seed(seed)
+
+        render_callback = RenderCallback(interval=2)
+
+        with set_exploration_type(exploration_type):
+            env.rollout(
+                max_steps=base_env.max_episode_length,
+                policy=policy,
+                callback=render_callback,
+                auto_reset=True,
+                break_when_any_done=False,
+                return_contiguous=False,
+            )
+        base_env.enable_render(not cfg.headless)
+        env.reset()
+        render_callback.t.close()
+
+        info = {}
+
+        if len(render_callback.frames) > 0 and run is not None and getattr(run, "dir", None):
+            video_dir = os.path.join(run.dir, "videos")
+            os.makedirs(video_dir, exist_ok=True)
+            filename = f"eval_{tag if tag is not None else 'final'}.mp4"
+            video_path = os.path.join(video_dir, filename)
+            try:
+                fps = 0.5 / (cfg.sim.dt * cfg.sim.substeps)
+                imageio.mimsave(video_path, render_callback.frames, fps=fps)
+                info["local_video_path"] = video_path
+            except Exception as exc:
+                logging.warning(f"Failed to save local eval video: {exc}")
+
+        if len(render_callback.frames) > 0:
+            try:
+                video_array = render_callback.get_video_array(axes="t c h w")
+                info["recording"] = wandb.Video(
+                    video_array,
+                    fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+                    format="mp4",
+                )
+            finally:
+                # aggressively release memory held by frames and intermediate arrays
+                render_callback.frames.clear()
+                if "video_array" in locals():
+                    del video_array
+        else:
+            render_callback.frames.clear()
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return info
 
-    pbar = tqdm(collector, total=total_frames//frames_per_batch)
+    video_interval = cfg.get("video_interval", total_frames // 20)
+    next_video_frame = video_interval if video_interval > 0 else None
+
+    pbar = tqdm(
+        collector,
+        total=total_frames//frames_per_batch,
+        disable=False,           # force display even if stdout is not a TTY
+        dynamic_ncols=True,      # adapt width to terminal
+        mininterval=0.5,         # update at least every 0.5s
+        file=sys.stdout,
+    )
     env.train()
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
@@ -180,20 +242,27 @@ def main(cfg):
 
         if eval_interval > 0 and i % eval_interval == 0:
             logging.info(f"Eval at {collector._frames} steps.")
-            info.update(evaluate())
+            info.update(evaluate(tag=str(collector._frames)))
             env.train()
             base_env.train()
+
+        if next_video_frame is not None and collector._frames >= next_video_frame:
+            logging.info(f"Recording video at {collector._frames} steps.")
+            info.update(record_video(tag=str(collector._frames)))
+            next_video_frame += video_interval
 
         if save_interval > 0 and i % save_interval == 0:
             try:
                 ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                 torch.save(policy.state_dict(), ckpt_path)
                 logging.info(f"Saved checkpoint to {str(ckpt_path)}")
             except AttributeError:
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         run.log(info)
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
+        # use tqdm-aware write to keep progress bar on its own line
+        pbar.write(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
         pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
 
@@ -202,11 +271,12 @@ def main(cfg):
 
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}
-    info.update(evaluate())
+    info.update(evaluate(tag="final"))
     run.log(info)
 
     try:
         ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         torch.save(policy.state_dict(), ckpt_path)
 
         model_artifact = wandb.Artifact(

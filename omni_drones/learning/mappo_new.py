@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
+import copy
 
 from torch.func import vmap
 from tensordict import TensorDict
@@ -36,8 +37,6 @@ from tensordict.nn import (
     TensorDictSequential,
     TensorDictModule,
     TensorDictModuleBase,
-    make_functional,
-    TensorDictParams
 )
 from torchrl.modules import ProbabilisticActor
 from torchrl.data import TensorSpec, Composite
@@ -106,16 +105,18 @@ class EnsembleModule(_EnsembleModule):
         self.out_keys = module.out_keys
         self.num_copies = num_copies
 
-        params_td = make_functional(module).expand(num_copies).to_tensordict()
-        self.module = module
-        self.vmapped_forward = vmap(self.module, (1, 0), 1)
-        self.reset_parameters_recursive(params_td)
-        self.params_td = TensorDictParams(params_td)
+        # keep independent copies for each agent when actors are not shared
+        self.module_list = nn.ModuleList([copy.deepcopy(module) for _ in range(num_copies)])
 
     def forward(self, tensordict: TensorDict):
         tensordict = tensordict.select(*self.in_keys)
-        tensordict.batch_size = [tensordict.shape[0], self.num_copies]
-        return self.vmapped_forward(tensordict, self.params_td)
+        # tensordict batch: [batch, num_agents]
+        outs = []
+        for i, mod in enumerate(self.module_list):
+            td_i = tensordict[:, i]
+            outs.append(mod(td_i))
+        # stack back along agent dimension
+        return TensorDict.stack(outs, dim=1)
 
 
 def init_(module):
@@ -142,6 +143,11 @@ class MAPPO:
         self.critic_loss_fn = nn.HuberLoss(delta=10)
         self.gae = GAE(0.99, 0.95)
 
+        # If a Composite is passed, peel out the per-agent action spec so we keep the agent dimension
+        # and avoid misclassifying multi-agent tasks as single-agent.
+        if isinstance(action_spec, Composite):
+            action_spec = action_spec[("agents", "action")]
+
         if not action_spec.ndim > 2:
             raise ValueError("Please use PPOPolicy for single-agent environments.")
 
@@ -167,16 +173,19 @@ class MAPPO:
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob"
         ).to(self.device)
 
+        # Centralized critic: flatten all agents' central obs then predict per-agent values
         self.critic = TensorDictModule(
             nn.Sequential(
+                nn.Flatten(-2),
                 make_mlp([512, 256], nn.Mish),
                 nn.LazyLinear(self.num_agents),
                 Rearrange("... -> ... 1")
             ),
-            [("agents", "observation_central")], ["state_value"]
+            [("agents", "observation_central", "drones")], ["state_value"]
         ).to(self.device)
         self.critic(fake_input)
         self.critic.apply(init_)
@@ -261,6 +270,21 @@ class MAPPO:
             "critic_grad_norm": critic_grad_norm,
             "explained_var": explained_var
         }, [])
+
+    def state_dict(self):
+        """Return checkpointable state for actor/critic/value norm."""
+        return {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "value_norm": self.value_norm.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restore state; used for resuming or evaluation."""
+        self.actor.load_state_dict(state_dict["actor"])
+        self.critic.load_state_dict(state_dict["critic"])
+        if "value_norm" in state_dict:
+            self.value_norm.load_state_dict(state_dict["value_norm"])
 
 
 def make_batch(tensordict: TensorDict, num_minibatches: int):

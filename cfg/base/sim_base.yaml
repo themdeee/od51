@@ -3,6 +3,7 @@ sim:
   substeps: 1
   gravity: [0, 0, -9.81]
   replicate_physics: false
+  enable_replicator: true
   use_flatcache: true
   use_gpu_pipeline: true
   device: "cuda:0"
