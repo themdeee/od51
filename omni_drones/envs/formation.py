@@ -51,9 +51,42 @@ REGULAR_TETRAGON = [
     [-1, 1, 0],
 ]
 
+# Add formation rules for S, N, C
+REGULAR_S = [
+    [-1.5, 1, 0],
+    [-1.5, 0, 0],
+    [-1, -1, 0],
+    [0, 0, 0],
+    [1, 1, 0],
+    [1.5, 0, 0],
+    [1.5, -1, 0],
+]
+
+REGULAR_N = [
+    [1.5, -1, 0],
+    [0, -1, 0],
+    [-1.5, -1, 0],
+    [-1.5, 0, 0],
+    [-1.5, 1, 0],
+    [0, 1, 0],
+    [1.5, 1, 0],
+]
+
+REGULAR_C = [
+    [-1.5, 1, 0],
+    [-1.5, 0, 0],
+    [-0.5, -1, 0],
+    [0.5, -1, 0],
+    [1.5, 0, 0],
+    [1.5, 1, 0],
+]
+
 FORMATIONS = {
     "hexagon": REGULAR_HEXAGON,
     "tetragon": REGULAR_TETRAGON,
+    "s": REGULAR_S,
+    "n": REGULAR_N,
+    "c": REGULAR_C,
 }
 
 def sample_from_grid(cells: torch.Tensor, n):
