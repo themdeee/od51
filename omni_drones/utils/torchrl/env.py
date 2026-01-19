@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import torch
+import logging
 import numpy as np
 import einops
 from tqdm import tqdm
@@ -89,16 +90,29 @@ class RenderCallback:
         self.frames = []
         self.i = 0
         self.t = tqdm(desc="Rendering")
+        self._skipped = 0
+        self._warned = False
 
     def __call__(self, env, *args):
         if self.i % self.interval == 0:
             frame = env.render(mode="rgb_array")
-            self.frames.append(frame)
+            if isinstance(frame, np.ndarray) and frame.ndim >= 3:
+                self.frames.append(frame)
+            else:
+                self._skipped += 1
+                if not self._warned:
+                    logging.warning(
+                        f"RenderCallback dropped frame at step {self.i}: type={type(frame)}, "
+                        f"ndim={getattr(frame, 'ndim', None)}, shape={getattr(frame, 'shape', None)}"
+                    )
+                    self._warned = True
             self.t.update(self.interval)
         self.i += 1
         return self.i
 
     def get_video_array(self, axes: str = "t c h w"):
+        if len(self.frames) == 0:
+            return None
         return einops.rearrange(np.stack(self.frames), "t h w c -> " + axes)
 
 

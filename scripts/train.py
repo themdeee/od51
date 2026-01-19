@@ -51,6 +51,12 @@ def main(cfg):
     from omni_drones.envs.isaac_env import IsaacEnv
 
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
+
+    record_video_enabled = cfg.get("record_video", False)
+    if record_video_enabled:
+        cfg.sim.allow_headless_render = True
+        cfg.sim.enable_replicator = True
+
     base_env = env_class(cfg, headless=cfg.headless)
 
     transforms = [InitTracker()]
@@ -159,27 +165,59 @@ def main(cfg):
         tag: str | None = None,
     ):
         """Record a rollout video while keeping memory usage low."""
+        if not record_video_enabled:
+            return {}
+        
         base_env.enable_render(True)
+        if record_video_enabled:
+            base_env.enable_viewport = True
+            try:
+                base_env._create_viewport_render_product()
+            except Exception as exc:
+                logging.warning(f"Failed to (re)create viewport for recording: {exc}")
         base_env.eval()
         env.eval()
         env.set_seed(seed)
 
         render_callback = RenderCallback(interval=2)
+        render_failed = {"error": None}
+
+        def safe_callback(env_cb, *args):
+            try:
+                return render_callback(env_cb, *args)
+            except Exception as exc:
+                render_failed["error"] = exc
+                return None
 
         with set_exploration_type(exploration_type):
-            env.rollout(
-                max_steps=base_env.max_episode_length,
-                policy=policy,
-                callback=render_callback,
-                auto_reset=True,
-                break_when_any_done=False,
-                return_contiguous=False,
-            )
-        base_env.enable_render(not cfg.headless)
-        env.reset()
-        render_callback.t.close()
+            try:
+                env.rollout(
+                    max_steps=base_env.max_episode_length,
+                    policy=policy,
+                    callback=safe_callback,
+                    auto_reset=True,
+                    break_when_any_done=False,
+                    return_contiguous=False,
+                )
+            except Exception as exc:
+                render_failed["error"] = render_failed["error"] or exc
+            base_env.enable_render(not cfg.headless)
+            base_env.enable_viewport = False
+            env.reset()
+            render_callback.t.close()
 
         info = {}
+
+        if render_failed["error"] is not None:
+            logging.warning(f"Render failed during video recording: {render_failed['error']}")
+            render_callback.frames.clear()
+            return info
+
+        if len(render_callback.frames) == 0:
+            logging.warning(
+                "No frames captured during video recording; check render settings (replicator, viewport)."
+            )
+            return info
 
         if len(render_callback.frames) > 0 and run is not None and getattr(run, "dir", None):
             video_dir = os.path.join(run.dir, "videos")
@@ -196,6 +234,8 @@ def main(cfg):
         if len(render_callback.frames) > 0:
             try:
                 video_array = render_callback.get_video_array(axes="t c h w")
+                if video_array is None:
+                    raise ValueError("no valid frames for video")
                 info["recording"] = wandb.Video(
                     video_array,
                     fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
@@ -215,8 +255,12 @@ def main(cfg):
 
         return info
 
-    video_interval = cfg.get("video_interval", total_frames // 20)
+    num_videos = cfg.get("num_videos", 20)
+    video_interval = cfg.get("video_interval", total_frames // num_videos)
     next_video_frame = video_interval if video_interval > 0 else None
+    if not record_video_enabled:
+        video_interval = None
+        next_video_frame = None
 
     pbar = tqdm(
         collector,

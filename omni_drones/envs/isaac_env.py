@@ -90,8 +90,17 @@ class IsaacEnv(EnvBase):
         )
         # store inputs to class
         self.cfg = cfg
-        self.enable_render(not headless)
-        self.enable_viewport = not headless
+
+        # default: no rendering in headless; show viewport when not headless
+        record_video = cfg.get("record_video", False)
+        self.record_video_enabled = record_video
+        if headless:
+            self.enable_render(False)
+            self.enable_viewport = False
+        else:
+            self.enable_render(True)
+            self.enable_viewport = True
+        
         # extract commonly used parameters
         self.num_envs = self.cfg.env.num_envs
         self.max_episode_length = self.cfg.env.max_episode_length
@@ -122,10 +131,12 @@ class IsaacEnv(EnvBase):
             physics_prim_path="/physicsScene",
             device=cfg.sim.device,
         )
-        self._create_viewport_render_product()
+        if self.enable_viewport:
+            self._create_viewport_render_product()
         self.dt = self.sim.get_physics_dt()
         # add flag for checking closing status
         self._is_closed = False
+        self._render_warned = False
         # set camera view
         # create cloner for duplicating the scenes
         cloner = GridCloner(spacing=self.cfg.env.env_spacing)
@@ -345,11 +356,11 @@ class IsaacEnv(EnvBase):
             enable_extension("omni.kit.viewport.bundle")
             # extension for window status bar
             enable_extension("omni.kit.window.status_bar")
-            # enable replicator extensions only if requested
-            if getattr(self.cfg.sim, "enable_replicator", False):
-                enable_extension("isaacsim.replicator.domain_randomization")
-                enable_extension("isaacsim.replicator.examples")
-                enable_extension("isaacsim.replicator.writers")
+        # enable replicator stack when requested for recording or synthetic data
+        if getattr(self.cfg.sim, "enable_replicator", False) and getattr(self, "record_video_enabled", False):
+            enable_extension("isaacsim.replicator.domain_randomization")
+            enable_extension("isaacsim.replicator.examples")
+            enable_extension("isaacsim.replicator.writers")
 
     def to(self, device) -> EnvBase:
         if torch.device(device) != self.device:
@@ -384,23 +395,36 @@ class IsaacEnv(EnvBase):
         if mode == "human":
             return None
         elif mode == "rgb_array":
-            # check if viewport is enabled -- if not, then complain because we won't get any data
             if not self.enable_viewport:
                 raise RuntimeError(
                     f"Cannot render '{mode}' when enable viewport is False. Please check the provided"
                     "arguments to the environment class at initialization."
                 )
-            # require replicator to be enabled to fetch rgb arrays
             if not getattr(self.cfg.sim, "enable_replicator", False) or not hasattr(self, "_rgb_annotator") or self._rgb_annotator is None:
                 raise RuntimeError(
                     "RGB rendering requires Replicator. Set cfg.sim.enable_replicator=True to enable it."
                 )
-            # obtain the rgb data
             rgb_data = self._rgb_annotator.get_data()
-            # convert to numpy array
-            rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
-            # return the rgb data
-            return rgb_data[:, :, :3]
+            if rgb_data is None:
+                if not self._render_warned:
+                    logging.warning("Render returned None buffer from annotator; skipping frame.")
+                    self._render_warned = True
+                return None
+            try:
+                arr = np.frombuffer(rgb_data, dtype=np.uint8)
+                if hasattr(rgb_data, "shape"):
+                    arr = arr.reshape(*rgb_data.shape)
+                if arr.ndim < 3:
+                    if not self._render_warned:
+                        logging.warning(f"Render buffer has ndim={arr.ndim}, shape={arr.shape}; skipping frame.")
+                        self._render_warned = True
+                    return None
+                return arr[:, :, :3]
+            except Exception as exc:
+                if not self._render_warned:
+                    logging.warning(f"Render buffer conversion failed: {exc}")
+                    self._render_warned = True
+                return None
         else:
             raise NotImplementedError(
                 f"Render mode '{mode}' is not supported. Please use: {self.metadata['render.modes']}."
@@ -423,6 +447,16 @@ class IsaacEnv(EnvBase):
 
         # check if viewport is enabled before creating render product
         if self.enable_viewport:
+            # keep camera centered on the central env for consistency
+            if hasattr(self, "central_env_idx"):
+                center = self.envs_positions[self.central_env_idx].cpu().numpy()
+                set_camera_view(
+                    eye=center + np.asarray(self.cfg.viewer.eye),
+                    target=center + np.asarray(self.cfg.viewer.lookat),
+                )
+            else:
+                set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
+
             if getattr(self.cfg.sim, "enable_replicator", False):
                 import omni.replicator.core as rep
                 # create render product

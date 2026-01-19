@@ -4,7 +4,10 @@ hydra:
     # see https://hydra.cc/docs/advanced/search_path/
     - file://../cfg
 
-headless: true
+headless: True
+
+record_video: True
+num_videos: 20
 
 sim: ${task.sim}
 env: ${task.env}
@@ -26,7 +29,7 @@ wandb:
   job_type: train
   entity:
   project: omnidrones
-  mode: online # set to 'disabled' when debugging locally
+  mode: disabled # set to 'disabled' when debugging locally
   run_id:
   monitor_gym: True
   tags:
