@@ -34,6 +34,12 @@ from omni_drones.learning import ALGOS
 from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
+def release_cache(reason: str | None = None):
+    if reason:
+        logging.debug(f"Clearing caches: {reason}")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 @hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg):
@@ -156,6 +162,8 @@ def main(cfg):
             for k, v in traj_stats.items()
         }
 
+        release_cache("evaluate rollout")
+
         return info
 
     @torch.no_grad()
@@ -242,16 +250,13 @@ def main(cfg):
                     format="mp4",
                 )
             finally:
-                # aggressively release memory held by frames and intermediate arrays
                 render_callback.frames.clear()
                 if "video_array" in locals():
                     del video_array
         else:
             render_callback.frames.clear()
 
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        release_cache("record_video")
 
         return info
 
@@ -289,11 +294,13 @@ def main(cfg):
             info.update(evaluate(tag=str(collector._frames)))
             env.train()
             base_env.train()
+            release_cache("post eval")
 
         if next_video_frame is not None and collector._frames >= next_video_frame:
             logging.info(f"Recording video at {collector._frames} steps.")
             info.update(record_video(tag=str(collector._frames)))
             next_video_frame += video_interval
+            release_cache("post video")
 
         if save_interval > 0 and i % save_interval == 0:
             try:
@@ -303,6 +310,7 @@ def main(cfg):
                 logging.info(f"Saved checkpoint to {str(ckpt_path)}")
             except AttributeError:
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
+            release_cache("post model")
 
         run.log(info)
         # use tqdm-aware write to keep progress bar on its own line
@@ -313,9 +321,12 @@ def main(cfg):
         if max_iters > 0 and i >= max_iters - 1:
             break
 
+    release_cache("end of training")
+    
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}
     info.update(evaluate(tag="final"))
+    release_cache("final eval")
     run.log(info)
 
     try:
