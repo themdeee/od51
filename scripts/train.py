@@ -322,12 +322,12 @@ def main(cfg):
             break
 
     release_cache("end of training")
-    
-    logging.info(f"Final Eval at {collector._frames} steps.")
-    info = {"env_frames": collector._frames}
-    info.update(evaluate(tag="final"))
-    release_cache("final eval")
-    run.log(info)
+
+    # logging.info(f"Final Eval at {collector._frames} steps.")
+    # info = {"env_frames": collector._frames}
+    # info.update(evaluate(tag="final"))
+    # release_cache("final eval")
+    # run.log(info)
 
     try:
         ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
